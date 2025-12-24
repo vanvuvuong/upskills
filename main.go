@@ -1,184 +1,1093 @@
+// Package main implements an interactive CLI tool for the SRE Learning Path.
+//
+// This tool provides a terminal-based markdown viewer with navigation,
+// checkbox toggling, note-taking, and progress tracking capabilities.
+// It renders markdown with ANSI colors and supports keyboard navigation.
+//
+// Usage:
+//
+//	go build -o sre-learn .
+//	./sre-learn
+//
+// The tool expects a file named "learning-path-full.md" in the current directory.
+//
+// Keyboard shortcuts:
+//
+// Content navigation:
+//   - j/↓: Scroll down within section
+//   - k/↑: Scroll up within section
+//
+// Section navigation:
+//   - n: Next section
+//   - p: Previous section
+//   - Enter: Next section
+//   - t: Open interactive TOC
+//   - g: Go to section by number
+//   - G: Go to last section
+//   - /: Search sections
+//
+// Features:
+//   - x: Toggle checkbox
+//   - a: Add note
+//   - s: Save file
+//
+// Display:
+//   - +: Increase visible lines
+//   - -: Decrease visible lines
+//   - ?: Show help
+//   - q: Quit
 package main
 
 import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const dataFile = "learning-path-full.md"
+// ANSI escape codes for terminal styling.
+// These constants provide color and formatting for terminal output.
+const (
+	// Text formatting
+	Reset     = "\033[0m"
+	Bold      = "\033[1m"
+	Dim       = "\033[2m"
+	Italic    = "\033[3m"
+	Underline = "\033[4m"
 
-var reader *bufio.Reader
+	// Foreground colors
+	Black   = "\033[30m"
+	Red     = "\033[31m"
+	Green   = "\033[32m"
+	Yellow  = "\033[33m"
+	Blue    = "\033[34m"
+	Magenta = "\033[35m"
+	Cyan    = "\033[36m"
+	White   = "\033[37m"
 
-func main() {
-	reader = bufio.NewReader(os.Stdin)
+	// Background colors
+	BgBlack   = "\033[40m"
+	BgRed     = "\033[41m"
+	BgGreen   = "\033[42m"
+	BgYellow  = "\033[43m"
+	BgBlue    = "\033[44m"
+	BgMagenta = "\033[45m"
+	BgCyan    = "\033[46m"
+	BgWhite   = "\033[47m"
+)
 
-	if _, err := os.Stat(dataFile); os.IsNotExist(err) {
-		initMarkdown()
+// Section represents a markdown section parsed from the document.
+// Each section corresponds to a header (# through ####) and its content.
+type Section struct {
+	// Title is the text after the # symbols
+	Title string
+	// Content is all text until the next header
+	Content string
+	// Level indicates header depth (1 = #, 2 = ##, etc.)
+	Level int
+	// Line is the line number in the source file (0-indexed)
+	Line int
+}
+
+// App holds the application state.
+// It encapsulates all mutable state for easier testing and management.
+type App struct {
+	// Sections contains all parsed markdown sections
+	Sections []Section
+	// CurrentIdx is the index of the currently displayed section
+	CurrentIdx int
+	// FilePath is the path to the markdown file
+	FilePath string
+	// FileContent is the raw file content
+	FileContent string
+	// FileLines is the file split by newlines
+	FileLines []string
+	// TermWidth is the terminal width in columns
+	TermWidth int
+	// TermHeight is the terminal height in rows
+	TermHeight int
+}
+
+// NewApp creates a new App instance with default values.
+// It initializes terminal dimensions and sets the default file path.
+func NewApp() *App {
+	return &App{
+		FilePath:   "learning-path-full.md",
+		TermWidth:  80,
+		TermHeight: 24,
 	}
+}
 
-	clearScreen()
-	printBanner()
+// LoadFile reads the markdown file into memory.
+// It populates FileContent and FileLines fields.
+// Returns an error if the file cannot be read.
+func (a *App) LoadFile() error {
+	data, err := os.ReadFile(a.FilePath)
+	if err != nil {
+		return fmt.Errorf("cannot read file %s: %w", a.FilePath, err)
+	}
+	a.FileContent = string(data)
+	a.FileLines = strings.Split(a.FileContent, "\n")
+	return nil
+}
 
-	for {
-		showMenu()
-		choice := readInput("\n→ ")
+// ParseSections extracts sections from the loaded markdown content.
+// A section starts with a header (# to ####) and includes all content
+// until the next header of any level.
+func (a *App) ParseSections() {
+	a.Sections = []Section{}
+	var currentSection *Section
+	var contentLines []string
 
-		switch choice {
-		case "1":
-			viewFile()
-		case "2":
-			toggleCheckbox()
-		case "3":
-			addNote()
-		case "4":
-			addDiscussion()
-		case "5":
-			openEditor()
-		case "q", "Q":
-			fmt.Println("\n👋 Tạm biệt!")
-			os.Exit(0)
+	headerRegex := regexp.MustCompile(`^(#{1,4})\s+(.+)$`)
+
+	for i, line := range a.FileLines {
+		if matches := headerRegex.FindStringSubmatch(line); matches != nil {
+			// Save previous section
+			if currentSection != nil {
+				currentSection.Content = strings.Join(contentLines, "\n")
+				a.Sections = append(a.Sections, *currentSection)
+			}
+
+			// Start new section
+			currentSection = &Section{
+				Title: matches[2],
+				Level: len(matches[1]),
+				Line:  i,
+			}
+			contentLines = []string{}
+		} else if currentSection != nil {
+			contentLines = append(contentLines, line)
 		}
 	}
+
+	// Save last section
+	if currentSection != nil {
+		currentSection.Content = strings.Join(contentLines, "\n")
+		a.Sections = append(a.Sections, *currentSection)
+	}
 }
 
-func printBanner() {
-	fmt.Println(`
-╔══════════════════════════════════════════════╗
-║     SRE LEARNING PATH - CLI                  ║
-║     File: learning-path.md                   ║
-╚══════════════════════════════════════════════╝`)
+// GetCurrentSection returns the currently selected section.
+// Returns nil if no sections exist or index is out of bounds.
+func (a *App) GetCurrentSection() *Section {
+	if len(a.Sections) == 0 || a.CurrentIdx < 0 || a.CurrentIdx >= len(a.Sections) {
+		return nil
+	}
+	return &a.Sections[a.CurrentIdx]
 }
 
-func showMenu() {
-	fmt.Println("\n1. Xem nội dung")
-	fmt.Println("2. Tick/Untick checkbox")
-	fmt.Println("3. Thêm ghi chú")
-	fmt.Println("4. Thêm thảo luận")
-	fmt.Println("5. Mở editor (vi)")
-	fmt.Println("q. Thoát")
+// NextSection moves to the next section if possible.
+// Returns true if the move was successful, false if already at the end.
+func (a *App) NextSection() bool {
+	if a.CurrentIdx < len(a.Sections)-1 {
+		a.CurrentIdx++
+		return true
+	}
+	return false
 }
 
-func viewFile() {
-	clearScreen()
-	content, _ := os.ReadFile(dataFile)
-	fmt.Println(string(content))
-	readInput("\n[Enter để quay lại]")
+// PrevSection moves to the previous section if possible.
+// Returns true if the move was successful, false if already at the beginning.
+func (a *App) PrevSection() bool {
+	if a.CurrentIdx > 0 {
+		a.CurrentIdx--
+		return true
+	}
+	return false
 }
 
-func toggleCheckbox() {
-	content, _ := os.ReadFile(dataFile)
-	lines := strings.Split(string(content), "\n")
+// GotoSection moves to the section at the given index.
+// Returns true if the index is valid, false otherwise.
+func (a *App) GotoSection(idx int) bool {
+	if idx >= 0 && idx < len(a.Sections) {
+		a.CurrentIdx = idx
+		return true
+	}
+	return false
+}
 
-	// Find all checkbox lines
-	checkboxes := []struct {
-		idx  int
-		line string
-	}{}
+// SearchSections finds all sections matching the query string.
+// The search is case-insensitive and matches both title and content.
+// Returns a slice of indices for matching sections.
+func (a *App) SearchSections(query string) []int {
+	query = strings.ToLower(query)
+	matches := []int{}
+
+	for i, sec := range a.Sections {
+		if strings.Contains(strings.ToLower(sec.Title), query) ||
+			strings.Contains(strings.ToLower(sec.Content), query) {
+			matches = append(matches, i)
+		}
+	}
+
+	return matches
+}
+
+// GetCheckboxLines returns the line indices of all checkboxes in the current section.
+// A checkbox is either "- [ ]" (unchecked) or "- [x]" (checked).
+func (a *App) GetCheckboxLines() []int {
+	sec := a.GetCurrentSection()
+	if sec == nil {
+		return nil
+	}
+
+	lines := strings.Split(sec.Content, "\n")
+	checkboxLines := []int{}
 
 	for i, line := range lines {
 		if strings.Contains(line, "- [ ]") || strings.Contains(line, "- [x]") {
-			checkboxes = append(checkboxes, struct {
-				idx  int
-				line string
-			}{i, line})
+			checkboxLines = append(checkboxLines, i)
 		}
 	}
 
-	clearScreen()
-	fmt.Println("═══ CHECKBOX ═══\n")
-	for i, cb := range checkboxes {
-		fmt.Printf("%2d. %s\n", i+1, strings.TrimSpace(cb.line))
-	}
-
-	fmt.Println("\nNhập số để toggle, 0 để quay lại")
-	choice := readInput("→ ")
-	idx, err := strconv.Atoi(choice)
-	if err != nil || idx < 1 || idx > len(checkboxes) {
-		return
-	}
-
-	lineIdx := checkboxes[idx-1].idx
-	if strings.Contains(lines[lineIdx], "- [ ]") {
-		lines[lineIdx] = strings.Replace(lines[lineIdx], "- [ ]", "- [x]", 1)
-	} else {
-		lines[lineIdx] = strings.Replace(lines[lineIdx], "- [x]", "- [ ]", 1)
-	}
-
-	os.WriteFile(dataFile, []byte(strings.Join(lines, "\n")), 0o644)
-	fmt.Println("✅ Đã cập nhật!")
+	return checkboxLines
 }
 
-func addNote() {
-	fmt.Println("\n📝 Nhập ghi chú (END để kết thúc):")
-	note := readMultiline()
+// ToggleCheckbox toggles the checkbox at the given content line index.
+// Returns true if a checkbox was toggled, false if the line has no checkbox.
+func (a *App) ToggleCheckbox(contentLineIdx int) bool {
+	sec := a.GetCurrentSection()
+	if sec == nil {
+		return false
+	}
+
+	lines := strings.Split(sec.Content, "\n")
+	if contentLineIdx < 0 || contentLineIdx >= len(lines) {
+		return false
+	}
+
+	line := lines[contentLineIdx]
+	if strings.Contains(line, "- [ ]") {
+		lines[contentLineIdx] = strings.Replace(line, "- [ ]", "- [x]", 1)
+	} else if strings.Contains(line, "- [x]") {
+		lines[contentLineIdx] = strings.Replace(line, "- [x]", "- [ ]", 1)
+	} else {
+		return false
+	}
+
+	a.Sections[a.CurrentIdx].Content = strings.Join(lines, "\n")
+	return true
+}
+
+// AddNote appends a timestamped note to the current section.
+// The note is formatted as a blockquote with the current timestamp.
+func (a *App) AddNote(note string) {
 	if note == "" {
 		return
 	}
 
-	content, _ := os.ReadFile(dataFile)
 	timestamp := time.Now().Format("2006-01-02 15:04")
-
-	newContent := string(content) + fmt.Sprintf("\n### Ghi chú - %s\n\n%s\n", timestamp, note)
-	os.WriteFile(dataFile, []byte(newContent), 0o644)
-	fmt.Println("✅ Đã thêm ghi chú!")
+	noteText := fmt.Sprintf("\n\n> **Ghi chú [%s]:** %s", timestamp, note)
+	a.Sections[a.CurrentIdx].Content += noteText
 }
 
-func addDiscussion() {
-	topic := readInput("\n📌 Chủ đề: ")
-	if topic == "" {
+// GetProgress calculates the completion progress for a section.
+// Returns (checked, total) where checked is the number of checked boxes
+// and total is the total number of checkboxes.
+func (a *App) GetProgress(sectionIdx int) (checked, total int) {
+	if sectionIdx < 0 || sectionIdx >= len(a.Sections) {
+		return 0, 0
+	}
+
+	content := a.Sections[sectionIdx].Content
+	checked = strings.Count(content, "- [x]")
+	total = checked + strings.Count(content, "- [ ]")
+	return
+}
+
+// GetTotalProgress calculates the overall progress across all sections.
+// Returns (checked, total) aggregated from all sections.
+func (a *App) GetTotalProgress() (checked, total int) {
+	for i := range a.Sections {
+		c, t := a.GetProgress(i)
+		checked += c
+		total += t
+	}
+	return
+}
+
+// UpdateFileSection updates the file lines to reflect changes in a section.
+// This syncs the in-memory section changes back to the file lines array.
+func (a *App) UpdateFileSection(idx int) {
+	if idx < 0 || idx >= len(a.Sections) {
 		return
 	}
 
-	fmt.Println("💬 Nội dung (END để kết thúc):")
-	content := readMultiline()
-	if content == "" {
-		return
+	sec := a.Sections[idx]
+	startLine := sec.Line
+
+	// Find end line
+	endLine := len(a.FileLines)
+	if idx < len(a.Sections)-1 {
+		endLine = a.Sections[idx+1].Line
 	}
 
-	fileContent, _ := os.ReadFile(dataFile)
-	timestamp := time.Now().Format("2006-01-02 15:04")
+	// Rebuild section content
+	headerLine := strings.Repeat("#", sec.Level) + " " + sec.Title
+	newLines := []string{headerLine}
+	newLines = append(newLines, strings.Split(sec.Content, "\n")...)
 
-	newContent := string(fileContent) + fmt.Sprintf("\n### Thảo luận: %s - %s\n\n%s\n", topic, timestamp, content)
-	os.WriteFile(dataFile, []byte(newContent), 0o644)
-	fmt.Println("✅ Đã thêm thảo luận!")
+	// Replace in fileLines
+	newFileLines := append(a.FileLines[:startLine], newLines...)
+	newFileLines = append(newFileLines, a.FileLines[endLine:]...)
+	a.FileLines = newFileLines
+
+	// Update file content
+	a.FileContent = strings.Join(a.FileLines, "\n")
 }
 
-func openEditor() {
-	fmt.Println("\n📄 Mở file bằng editor yêu thích:")
-	fmt.Printf("   vi %s\n", dataFile)
-	fmt.Printf("   nano %s\n", dataFile)
-	fmt.Printf("   code %s\n", dataFile)
+// SaveFile writes the current file content to disk.
+// Returns an error if the file cannot be written.
+func (a *App) SaveFile() error {
+	a.FileContent = strings.Join(a.FileLines, "\n")
+	return os.WriteFile(a.FilePath, []byte(a.FileContent), 0o644)
 }
 
-func readInput(prompt string) string {
-	fmt.Print(prompt)
-	text, _ := reader.ReadString('\n')
-	return strings.TrimSpace(text)
+// RenderLine converts a markdown line to ANSI-styled terminal output.
+// It handles checkboxes, bold, italic, code, bullets, and blockquotes.
+func RenderLine(line string, termWidth int) string {
+	// Checkbox: - [ ] or - [x]
+	if strings.Contains(line, "- [ ]") {
+		line = strings.Replace(line, "- [ ]", Red+"☐"+Reset, 1)
+	}
+	if strings.Contains(line, "- [x]") {
+		line = strings.Replace(line, "- [x]", Green+"☑"+Reset, 1)
+	}
+
+	// Bold: **text**
+	boldRegex := regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	line = boldRegex.ReplaceAllString(line, Bold+"$1"+Reset)
+
+	// Italic: *text* (but not **)
+	italicRegex := regexp.MustCompile(`(?:^|[^*])\*([^*]+)\*(?:[^*]|$)`)
+	line = italicRegex.ReplaceAllString(line, Italic+"$1"+Reset)
+
+	// Inline code: `code`
+	codeRegex := regexp.MustCompile("`([^`]+)`")
+	line = codeRegex.ReplaceAllString(line, BgBlack+Cyan+"$1"+Reset)
+
+	// Bullet points (but not checkboxes)
+	if strings.HasPrefix(strings.TrimSpace(line), "- ") &&
+		!strings.Contains(line, "☐") &&
+		!strings.Contains(line, "☑") {
+		line = strings.Replace(line, "- ", Yellow+"• "+Reset, 1)
+	}
+
+	// Numbered lists
+	numRegex := regexp.MustCompile(`^(\s*)(\d+)\.\s`)
+	line = numRegex.ReplaceAllString(line, "$1"+Cyan+"$2."+Reset+" ")
+
+	// Quote blocks: > text
+	if strings.HasPrefix(strings.TrimSpace(line), ">") {
+		line = Dim + "│ " + strings.TrimPrefix(strings.TrimSpace(line), "> ") + Reset
+	}
+
+	// Horizontal rule
+	if strings.TrimSpace(line) == "---" {
+		line = Dim + strings.Repeat("─", termWidth-4) + Reset
+	}
+
+	// Table separator
+	if strings.Contains(line, "|") && strings.Contains(line, "---") {
+		line = Dim + line + Reset
+	}
+
+	return line
 }
 
-func readMultiline() string {
-	var lines []string
-	for {
-		line, _ := reader.ReadString('\n')
-		line = strings.TrimRight(line, "\n\r")
-		if strings.ToUpper(line) == "END" {
-			break
+// Renderer handles all terminal output operations.
+type Renderer struct {
+	App          *App
+	TermWidth    int
+	TermHeight   int
+	ScrollOffset int // Track scroll within section content
+	PageSize     int // Number of lines per page (user adjustable)
+}
+
+// NewRenderer creates a new Renderer for the given App.
+func NewRenderer(app *App) *Renderer {
+	// Default to showing more content - user can adjust with +/-
+	pageSize := app.TermHeight - 6
+	if pageSize < 15 {
+		pageSize = 15
+	}
+	return &Renderer{
+		App:          app,
+		TermWidth:    app.TermWidth,
+		TermHeight:   app.TermHeight,
+		ScrollOffset: 0,
+		PageSize:     pageSize,
+	}
+}
+
+// ResetScroll resets the content scroll position.
+func (r *Renderer) ResetScroll() {
+	r.ScrollOffset = 0
+}
+
+// ScrollDown scrolls content down.
+// Returns true if scrolled, false if already at bottom.
+func (r *Renderer) ScrollDown() bool {
+	sec := r.App.GetCurrentSection()
+	if sec == nil {
+		return false
+	}
+
+	lines := strings.Split(sec.Content, "\n")
+
+	if r.ScrollOffset+r.PageSize < len(lines) {
+		r.ScrollOffset += 3 // Scroll by 3 lines for smoother navigation
+		return true
+	}
+	return false
+}
+
+// ScrollUp scrolls content up.
+// Returns true if scrolled, false if already at top.
+func (r *Renderer) ScrollUp() bool {
+	if r.ScrollOffset > 0 {
+		r.ScrollOffset -= 3 // Scroll by 3 lines
+		if r.ScrollOffset < 0 {
+			r.ScrollOffset = 0
 		}
-		lines = append(lines, line)
+		return true
 	}
-	return strings.Join(lines, "\n")
+	return false
 }
 
-func clearScreen() {
+// AdjustPageSize changes the number of visible lines.
+// Minimum is 5 lines, no upper limit (content will scroll in terminal if needed).
+func (r *Renderer) AdjustPageSize(delta int) {
+	r.PageSize += delta
+	if r.PageSize < 5 {
+		r.PageSize = 5
+	}
+	// No upper limit - let user decide how much to show
+}
+
+// ClearScreen clears the terminal screen.
+func ClearScreen() {
 	fmt.Print("\033[H\033[2J")
 }
 
-func initMarkdown() {
-	fmt.Println("⚠️  File learning-path-full.md không tìm thấy!")
-	fmt.Println("   Đặt file vào cùng thư mục với CLI tool.")
-	os.Exit(1)
+// Render displays the current section with header and footer.
+func (r *Renderer) Render() {
+	ClearScreen()
+
+	if len(r.App.Sections) == 0 {
+		fmt.Println("Không có sections.")
+		return
+	}
+
+	sec := r.App.GetCurrentSection()
+	if sec == nil {
+		return
+	}
+
+	r.printHeader(sec)
+	r.printContent(sec.Content)
+	r.printFooter()
+}
+
+// printHeader renders the top bar with progress and section title.
+func (r *Renderer) printHeader(sec *Section) {
+	// Progress bar
+	progress := float64(r.App.CurrentIdx+1) / float64(len(r.App.Sections)) * 100
+	barWidth := 20
+	filled := int(float64(barWidth) * float64(r.App.CurrentIdx+1) / float64(len(r.App.Sections)))
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+	fmt.Printf("%s%s", BgBlue+White+Bold, strings.Repeat(" ", r.TermWidth))
+	fmt.Print("\r")
+	fmt.Printf(" 📖 SRE Learning Path  [%s] %.0f%%  (%d/%d)", bar, progress, r.App.CurrentIdx+1, len(r.App.Sections))
+	fmt.Printf("%s\n", Reset)
+
+	// Section title
+	levelColors := []string{White, Cyan, Yellow, Green}
+	levelColor := levelColors[min(sec.Level-1, 3)]
+	prefix := strings.Repeat("  ", sec.Level-1)
+	fmt.Printf("\n%s%s%s %s%s\n", prefix, Bold+levelColor, strings.Repeat("#", sec.Level), sec.Title, Reset)
+	fmt.Println(Dim + strings.Repeat("─", r.TermWidth-4) + Reset)
+}
+
+// printContent renders the section content with markdown styling.
+func (r *Renderer) printContent(content string) {
+	lines := strings.Split(content, "\n")
+
+	rendered := make([]string, len(lines))
+	for i, line := range lines {
+		rendered[i] = RenderLine(line, r.TermWidth)
+	}
+
+	// Apply scroll offset
+	startIdx := r.ScrollOffset
+	if startIdx >= len(rendered) {
+		startIdx = 0
+		r.ScrollOffset = 0
+	}
+
+	endIdx := min(startIdx+r.PageSize, len(rendered))
+	displayLines := rendered[startIdx:endIdx]
+
+	for _, line := range displayLines {
+		fmt.Println(line)
+	}
+
+	// Show position indicator
+	if len(rendered) > r.PageSize {
+		above := startIdx
+		below := len(rendered) - endIdx
+
+		posInfo := fmt.Sprintf("[%d-%d/%d]", startIdx+1, endIdx, len(rendered))
+		scrollHint := ""
+
+		if above > 0 && below > 0 {
+			scrollHint = fmt.Sprintf("↑%d ↓%d", above, below)
+		} else if above > 0 {
+			scrollHint = fmt.Sprintf("↑%d (k lên đầu)", above)
+		} else if below > 0 {
+			scrollHint = fmt.Sprintf("↓%d (j xem tiếp)", below)
+		}
+
+		fmt.Printf("\n%s%s %s  [%d dòng/trang, +/- chỉnh]%s", Dim, posInfo, scrollHint, r.PageSize, Reset)
+	}
+}
+
+// printFooter renders the bottom navigation bar.
+func (r *Renderer) printFooter() {
+	fmt.Println()
+	fmt.Printf("%s%s", BgBlack+White, strings.Repeat(" ", r.TermWidth))
+	fmt.Print("\r")
+	fmt.Printf(" %sj%s↓ %sk%s↑ scroll | %sn%s/%sp%s section | %st%s toc %sx%s tick %s?%s help %sq%s quit",
+		Bold+Cyan, Reset+BgBlack+White,
+		Bold+Cyan, Reset+BgBlack+White,
+		Bold+Cyan, Reset+BgBlack+White,
+		Bold+Cyan, Reset+BgBlack+White,
+		Bold+Cyan, Reset+BgBlack+White,
+		Bold+Cyan, Reset+BgBlack+White,
+		Bold+Cyan, Reset+BgBlack+White,
+		Bold+Cyan, Reset+BgBlack+White)
+	fmt.Printf("%s\n", Reset)
+}
+
+// Terminal provides terminal manipulation utilities.
+type Terminal struct{}
+
+// GetSize returns the terminal dimensions (width, height).
+// Falls back to 80x24 if unable to determine.
+func (t *Terminal) GetSize() (width, height int) {
+	cmd := exec.Command("stty", "size")
+	cmd.Stdin = os.Stdin
+	out, err := cmd.Output()
+	if err == nil {
+		fmt.Sscanf(string(out), "%d %d", &height, &width)
+		return width, height
+	}
+	return 80, 24
+}
+
+// SetRawMode enables or disables raw terminal mode.
+// In raw mode, input is read character by character without echo.
+func (t *Terminal) SetRawMode(enable bool) {
+	if enable {
+		exec.Command("stty", "-F", "/dev/tty", "cbreak", "min", "1", "-echo").Run()
+	} else {
+		exec.Command("stty", "-F", "/dev/tty", "-cbreak", "echo").Run()
+	}
+}
+
+// min returns the smaller of two integers.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Global instances for main program
+var (
+	app      *App
+	renderer *Renderer
+	terminal *Terminal
+	reader   *bufio.Reader
+)
+
+func main() {
+	app = NewApp()
+	terminal = &Terminal{}
+
+	// Get terminal size
+	app.TermWidth, app.TermHeight = terminal.GetSize()
+
+	// Load and parse file
+	if err := app.LoadFile(); err != nil {
+		fmt.Printf("❌ Lỗi: %v\n", err)
+		fmt.Println("Đặt file learning-path-full.md cùng thư mục.")
+		os.Exit(1)
+	}
+	app.ParseSections()
+
+	renderer = NewRenderer(app)
+	reader = bufio.NewReader(os.Stdin)
+
+	// Enable raw mode for keyboard input
+	terminal.SetRawMode(true)
+	defer terminal.SetRawMode(false)
+
+	// Main loop
+	for {
+		renderer.Render()
+		handleInput()
+	}
+}
+
+// handleInput reads and processes a single keyboard input.
+func handleInput() {
+	b := make([]byte, 3)
+	os.Stdin.Read(b)
+
+	switch {
+	// Content scrolling within section
+	case b[0] == 'j' || (b[0] == 27 && b[1] == 91 && b[2] == 66): // j or down arrow
+		renderer.ScrollDown()
+	case b[0] == 'k' || (b[0] == 27 && b[1] == 91 && b[2] == 65): // k or up arrow
+		renderer.ScrollUp()
+
+	// Section navigation
+	case b[0] == 'n': // next section
+		if app.NextSection() {
+			renderer.ResetScroll()
+		}
+	case b[0] == 'p': // previous section
+		if app.PrevSection() {
+			renderer.ResetScroll()
+		}
+	case b[0] == 13 || b[0] == 10: // Enter - next section
+		if app.NextSection() {
+			renderer.ResetScroll()
+		}
+
+	// Features
+	case b[0] == 't' || b[0] == 'T': // TOC
+		handleTOC()
+		renderer.ResetScroll()
+	case b[0] == 'x' || b[0] == 'X': // toggle checkbox (x = check)
+		handleToggle()
+	case b[0] == 'g': // goto section
+		handleGoto()
+		renderer.ResetScroll()
+	case b[0] == 'G': // goto last section
+		app.GotoSection(len(app.Sections) - 1)
+		renderer.ResetScroll()
+	case b[0] == '/': // search
+		handleSearch()
+		renderer.ResetScroll()
+	case b[0] == 'a' || b[0] == 'A': // add note
+		handleNote()
+
+	// Display settings
+	case b[0] == '+' || b[0] == '=': // increase visible lines
+		renderer.AdjustPageSize(10)
+	case b[0] == '-' || b[0] == '_': // decrease visible lines
+		renderer.AdjustPageSize(-10)
+
+	// System
+	case b[0] == 's' || b[0] == 'S': // save
+		app.SaveFile()
+	case b[0] == 'q' || b[0] == 'Q' || b[0] == 3: // quit or Ctrl+C
+		terminal.SetRawMode(false)
+		ClearScreen()
+		fmt.Println("👋 Tạm biệt! File đã lưu.")
+		os.Exit(0)
+	case b[0] == '?': // help
+		handleHelp()
+	}
+}
+
+// handleGoto displays section list and jumps to selected section.
+func handleGoto() {
+	terminal.SetRawMode(false)
+	ClearScreen()
+
+	fmt.Println(Bold + "📑 DANH SÁCH SECTIONS" + Reset)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+
+	for i, sec := range app.Sections {
+		prefix := strings.Repeat("  ", sec.Level-1)
+		marker := ""
+		if i == app.CurrentIdx {
+			marker = Green + " ◀" + Reset
+		}
+
+		checked, total := app.GetProgress(i)
+		progress := ""
+		if total > 0 {
+			progress = fmt.Sprintf(" %s[%d/%d]%s", Dim, checked, total, Reset)
+		}
+
+		fmt.Printf("%s%3d. %s%s%s%s\n", Cyan, i+1, Reset, prefix, sec.Title, progress+marker)
+	}
+
+	fmt.Printf("\n%sNhập số (1-%d) hoặc Enter để hủy:%s ", Bold, len(app.Sections), Reset)
+
+	inputReader := bufio.NewReader(os.Stdin)
+	input, _ := inputReader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	if num, err := strconv.Atoi(input); err == nil {
+		app.GotoSection(num - 1)
+	}
+
+	terminal.SetRawMode(true)
+}
+
+// handleSearch prompts for search query and shows matching sections.
+func handleSearch() {
+	terminal.SetRawMode(false)
+	ClearScreen()
+
+	fmt.Printf("%s🔍 Tìm kiếm:%s ", Bold, Reset)
+
+	inputReader := bufio.NewReader(os.Stdin)
+	query, _ := inputReader.ReadString('\n')
+	query = strings.TrimSpace(query)
+
+	if query == "" {
+		terminal.SetRawMode(true)
+		return
+	}
+
+	matches := app.SearchSections(query)
+
+	if len(matches) == 0 {
+		fmt.Println(Red + "Không tìm thấy." + Reset)
+		time.Sleep(time.Second)
+		terminal.SetRawMode(true)
+		return
+	}
+
+	fmt.Printf("\n%sTìm thấy %d kết quả:%s\n\n", Green, len(matches), Reset)
+	for j, i := range matches {
+		fmt.Printf("%s%2d.%s %s\n", Cyan, j+1, Reset, app.Sections[i].Title)
+	}
+
+	fmt.Printf("\n%sChọn số hoặc Enter để hủy:%s ", Bold, Reset)
+	input, _ := inputReader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	if num, err := strconv.Atoi(input); err == nil && num >= 1 && num <= len(matches) {
+		app.GotoSection(matches[num-1])
+	}
+
+	terminal.SetRawMode(true)
+}
+
+// handleToggle displays checkboxes and toggles the selected one.
+func handleToggle() {
+	checkboxLines := app.GetCheckboxLines()
+	if len(checkboxLines) == 0 {
+		return
+	}
+
+	terminal.SetRawMode(false)
+	ClearScreen()
+
+	sec := app.GetCurrentSection()
+	lines := strings.Split(sec.Content, "\n")
+
+	fmt.Printf("%s☑ TOGGLE CHECKBOX%s\n", Bold, Reset)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+
+	for j, lineIdx := range checkboxLines {
+		line := lines[lineIdx]
+		status := Red + "☐" + Reset
+		if strings.Contains(line, "- [x]") {
+			status = Green + "☑" + Reset
+		}
+		text := strings.TrimSpace(line)
+		text = strings.TrimPrefix(text, "- [ ]")
+		text = strings.TrimPrefix(text, "- [x]")
+		text = strings.TrimSpace(text)
+
+		fmt.Printf("%s%2d.%s %s %s\n", Cyan, j+1, Reset, status, text)
+	}
+
+	fmt.Printf("\n%sNhập số để toggle (hoặc Enter để hủy):%s ", Bold, Reset)
+
+	inputReader := bufio.NewReader(os.Stdin)
+	input, _ := inputReader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	if num, err := strconv.Atoi(input); err == nil && num >= 1 && num <= len(checkboxLines) {
+		lineIdx := checkboxLines[num-1]
+		if app.ToggleCheckbox(lineIdx) {
+			app.UpdateFileSection(app.CurrentIdx)
+			app.ParseSections() // Re-parse to update line numbers
+			app.SaveFile()
+		}
+	}
+
+	terminal.SetRawMode(true)
+}
+
+// handleNote prompts for note text and adds it to current section.
+func handleNote() {
+	terminal.SetRawMode(false)
+	ClearScreen()
+
+	sec := app.GetCurrentSection()
+	fmt.Printf("%s📝 THÊM GHI CHÚ%s\n", Bold, Reset)
+	fmt.Printf("Section: %s\n", sec.Title)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+	fmt.Println("Nhập ghi chú (Enter 2 lần để kết thúc):")
+	fmt.Println()
+
+	inputReader := bufio.NewReader(os.Stdin)
+	var noteLines []string
+	emptyCount := 0
+
+	for {
+		line, _ := inputReader.ReadString('\n')
+		line = strings.TrimRight(line, "\n\r")
+
+		if line == "" {
+			emptyCount++
+			if emptyCount >= 2 {
+				break
+			}
+		} else {
+			emptyCount = 0
+		}
+		noteLines = append(noteLines, line)
+	}
+
+	note := strings.TrimSpace(strings.Join(noteLines, "\n"))
+	if note != "" {
+		app.AddNote(note)
+		app.UpdateFileSection(app.CurrentIdx)
+		app.ParseSections()
+		app.SaveFile()
+		fmt.Println(Green + "✅ Đã lưu ghi chú!" + Reset)
+		time.Sleep(time.Second)
+	}
+
+	terminal.SetRawMode(true)
+}
+
+// handleHelp displays all keyboard shortcuts.
+func handleHelp() {
+	ClearScreen()
+
+	fmt.Printf("%s%s", BgCyan+Black+Bold, strings.Repeat(" ", app.TermWidth))
+	fmt.Print("\r")
+	fmt.Printf(" ❓ KEYBOARD SHORTCUTS")
+	fmt.Printf("%s\n\n", Reset)
+
+	helpItems := []struct {
+		key  string
+		desc string
+	}{
+		{"j / ↓", "Scroll xuống trong section"},
+		{"k / ↑", "Scroll lên trong section"},
+		{"n", "Section tiếp theo (next)"},
+		{"p", "Section trước (previous)"},
+		{"Enter", "Section tiếp theo"},
+		{"", ""},
+		{"t", "Mở Table of Contents"},
+		{"g", "Goto - nhảy đến section"},
+		{"G", "Goto section cuối"},
+		{"/", "Tìm kiếm section"},
+		{"", ""},
+		{"x", "Toggle checkbox (tick/untick)"},
+		{"a", "Thêm ghi chú (add note)"},
+		{"s", "Lưu file"},
+		{"", ""},
+		{"+", "Tăng 10 dòng hiển thị"},
+		{"-", "Giảm 10 dòng hiển thị"},
+		{"", ""},
+		{"?", "Hiển thị help này"},
+		{"q", "Thoát"},
+	}
+
+	for _, item := range helpItems {
+		if item.key == "" {
+			fmt.Println()
+		} else {
+			fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, item.key, Reset, item.desc)
+		}
+	}
+
+	fmt.Printf("\n%sTrong TOC:%s\n", Bold+Magenta, Reset)
+	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "j/k", Reset, "Di chuyển lên/xuống")
+	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "Enter", Reset, "Chọn section")
+	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "q/Esc", Reset, "Đóng TOC")
+
+	fmt.Printf("\n%sHiện tại: %d dòng/trang (nhấn +/- để chỉnh, không giới hạn)%s\n", Dim, renderer.PageSize, Reset)
+
+	fmt.Printf("\n%s[Nhấn phím bất kỳ để quay lại]%s", Dim, Reset)
+
+	// Wait for any key
+	b := make([]byte, 1)
+	os.Stdin.Read(b)
+}
+
+// handleTOC displays an interactive table of contents.
+// Supports j/k navigation, Enter to select, q to quit.
+func handleTOC() {
+	// Build list of navigable sections (skip phase headers)
+	type tocItem struct {
+		idx   int
+		title string
+		level int
+	}
+
+	items := []tocItem{}
+	for i, sec := range app.Sections {
+		items = append(items, tocItem{i, sec.Title, sec.Level})
+	}
+
+	if len(items) == 0 {
+		return
+	}
+
+	// Find current position in TOC
+	tocIdx := 0
+	for i, item := range items {
+		if item.idx == app.CurrentIdx {
+			tocIdx = i
+			break
+		}
+	}
+
+	// Scrolling state
+	scrollOffset := 0
+	maxVisible := app.TermHeight - 6
+
+	for {
+		ClearScreen()
+
+		// Header
+		fmt.Printf("%s%s", BgMagenta+White+Bold, strings.Repeat(" ", app.TermWidth))
+		fmt.Print("\r")
+		fmt.Printf(" 📚 MỤC LỤC  (j/k: di chuyển, Enter: chọn, q: đóng)")
+		fmt.Printf("%s\n\n", Reset)
+
+		// Adjust scroll to keep selection visible
+		if tocIdx < scrollOffset {
+			scrollOffset = tocIdx
+		}
+		if tocIdx >= scrollOffset+maxVisible {
+			scrollOffset = tocIdx - maxVisible + 1
+		}
+
+		// Display items
+		endIdx := min(scrollOffset+maxVisible, len(items))
+		for i := scrollOffset; i < endIdx; i++ {
+			item := items[i]
+
+			// Selection indicator
+			selector := "  "
+			if i == tocIdx {
+				selector = Green + "▶ " + Reset
+			}
+
+			// Indentation based on level
+			indent := strings.Repeat("  ", item.level-1)
+
+			// Progress indicator
+			checked, total := app.GetProgress(item.idx)
+			progress := ""
+			if total > 0 {
+				pct := float64(checked) / float64(total) * 100
+				if pct == 100 {
+					progress = Green + " ✓" + Reset
+				} else if pct > 0 {
+					progress = fmt.Sprintf(" %s%.0f%%%s", Yellow, pct, Reset)
+				} else {
+					progress = Dim + " ○" + Reset
+				}
+			}
+
+			// Current section marker
+			current := ""
+			if item.idx == app.CurrentIdx {
+				current = Cyan + " (hiện tại)" + Reset
+			}
+
+			// Title styling based on level
+			title := item.title
+			if len(title) > 50 {
+				title = title[:47] + "..."
+			}
+
+			titleStyle := ""
+			switch item.level {
+			case 1:
+				titleStyle = Bold + White
+			case 2:
+				titleStyle = Bold + Magenta
+			case 3:
+				titleStyle = Cyan
+			default:
+				titleStyle = Dim
+			}
+
+			// Print row
+			fmt.Printf("%s%s%s%s%s%s%s\n", selector, indent, titleStyle, title, Reset, progress, current)
+		}
+
+		// Scroll indicators
+		if scrollOffset > 0 {
+			fmt.Printf("\n%s  ↑ còn %d mục phía trên%s", Dim, scrollOffset, Reset)
+		}
+		if endIdx < len(items) {
+			if scrollOffset == 0 {
+				fmt.Println()
+			}
+			fmt.Printf("\n%s  ↓ còn %d mục phía dưới%s", Dim, len(items)-endIdx, Reset)
+		}
+
+		// Footer with total progress
+		fmt.Println()
+		checked, total := app.GetTotalProgress()
+		if total > 0 {
+			pct := float64(checked) / float64(total) * 100
+			barWidth := 20
+			filled := int(float64(barWidth) * pct / 100)
+			bar := Green + strings.Repeat("█", filled) + Dim + strings.Repeat("░", barWidth-filled) + Reset
+			fmt.Printf("\n  Tiến độ: [%s] %d/%d (%.0f%%)\n", bar, checked, total, pct)
+		}
+
+		// Read input
+		b := make([]byte, 3)
+		os.Stdin.Read(b)
+
+		switch {
+		case b[0] == 'j' || (b[0] == 27 && b[1] == 91 && b[2] == 66): // j or down
+			if tocIdx < len(items)-1 {
+				tocIdx++
+			}
+		case b[0] == 'k' || (b[0] == 27 && b[1] == 91 && b[2] == 65): // k or up
+			if tocIdx > 0 {
+				tocIdx--
+			}
+		case b[0] == 'g': // go to top
+			tocIdx = 0
+			scrollOffset = 0
+		case b[0] == 'G': // go to bottom
+			tocIdx = len(items) - 1
+		case b[0] == 13 || b[0] == 10: // Enter - select
+			app.GotoSection(items[tocIdx].idx)
+			return
+		case b[0] == 'q' || b[0] == 'Q' || b[0] == 27: // q or Escape - close
+			return
+		case b[0] == ' ': // Space - page down
+			tocIdx = min(tocIdx+maxVisible, len(items)-1)
+		}
+	}
 }
