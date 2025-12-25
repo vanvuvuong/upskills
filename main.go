@@ -40,6 +40,7 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
 	"fmt"
 	"os"
 	"os/exec"
@@ -48,6 +49,9 @@ import (
 	"strings"
 	"time"
 )
+
+//go:embed templates/default.md
+var defaultTemplate string
 
 // ANSI escape codes for terminal styling.
 // These constants provide color and formatting for terminal output.
@@ -110,6 +114,8 @@ type App struct {
 	TermWidth int
 	// TermHeight is the terminal height in rows
 	TermHeight int
+	// StateFile is the path to save/load state
+	StateFile string
 }
 
 // NewApp creates a new App instance with default values.
@@ -117,9 +123,53 @@ type App struct {
 func NewApp() *App {
 	return &App{
 		FilePath:   "learning-path-full.md",
+		StateFile:  ".sre-learn-state",
 		TermWidth:  80,
 		TermHeight: 24,
 	}
+}
+
+// SaveState saves current reading position and settings to state file.
+func (a *App) SaveState(pageSize int) error {
+	content := fmt.Sprintf("current_section=%d\npage_size=%d\nfile_path=%s\n",
+		a.CurrentIdx, pageSize, a.FilePath)
+	return os.WriteFile(a.StateFile, []byte(content), 0o644)
+}
+
+// LoadState restores reading position and settings from state file.
+// Returns (pageSize, error). If file doesn't exist, returns defaults.
+func (a *App) LoadState() (int, error) {
+	data, err := os.ReadFile(a.StateFile)
+	if err != nil {
+		return 0, err // File doesn't exist, use defaults
+	}
+
+	pageSize := 0
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, value := parts[0], parts[1]
+		switch key {
+		case "current_section":
+			if idx, err := strconv.Atoi(value); err == nil {
+				a.CurrentIdx = idx
+			}
+		case "page_size":
+			if ps, err := strconv.Atoi(value); err == nil {
+				pageSize = ps
+			}
+		case "file_path":
+			// Only use saved file_path if current one is default
+			if a.FilePath == "learning-path-full.md" && value != "" {
+				a.FilePath = value
+			}
+		}
+	}
+
+	return pageSize, nil
 }
 
 // LoadFile reads the markdown file into memory.
@@ -563,7 +613,8 @@ func (r *Renderer) printFooter() {
 	fmt.Println()
 	fmt.Printf("%s%s", BgBlack+White, strings.Repeat(" ", r.TermWidth))
 	fmt.Print("\r")
-	fmt.Printf(" %sj%s↓ %sk%s↑ scroll | %sn%s/%sp%s section | %st%s toc %sx%s tick %s?%s help %sq%s quit",
+	fmt.Printf(" %sj%s/%sk%s scroll %sn%s/%sp%s section %st%s toc %sx%s tick %sa%s note %s?%s help %sq%s quit",
+		Bold+Cyan, Reset+BgBlack+White,
 		Bold+Cyan, Reset+BgBlack+White,
 		Bold+Cyan, Reset+BgBlack+White,
 		Bold+Cyan, Reset+BgBlack+White,
@@ -624,26 +675,98 @@ func main() {
 	// Get terminal size
 	app.TermWidth, app.TermHeight = terminal.GetSize()
 
-	// Load and parse file
+	// Check if file exists, prompt if not
+	if !fileExists(app.FilePath) {
+		handleFileNotFound()
+	}
+
+	// Load file
 	if err := app.LoadFile(); err != nil {
 		fmt.Printf("❌ Lỗi: %v\n", err)
-		fmt.Println("Đặt file learning-path-full.md cùng thư mục.")
 		os.Exit(1)
 	}
 	app.ParseSections()
 
+	// Create renderer with default settings
 	renderer = NewRenderer(app)
 	reader = bufio.NewReader(os.Stdin)
 
+	// Load saved state (position, page size)
+	if savedPageSize, err := app.LoadState(); err == nil {
+		if savedPageSize > 0 {
+			renderer.PageSize = savedPageSize
+		}
+		// Validate CurrentIdx
+		if app.CurrentIdx >= len(app.Sections) {
+			app.CurrentIdx = 0
+		}
+	}
+
 	// Enable raw mode for keyboard input
 	terminal.SetRawMode(true)
-	defer terminal.SetRawMode(false)
+	defer func() {
+		terminal.SetRawMode(false)
+		// Save state on exit
+		app.SaveState(renderer.PageSize)
+	}()
 
 	// Main loop
 	for {
 		renderer.Render()
 		handleInput()
 	}
+}
+
+// fileExists checks if a file exists.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// handleFileNotFound prompts user when the markdown file doesn't exist.
+func handleFileNotFound() {
+	fmt.Printf("%s📚 SRE Learning Path CLI%s\n\n", Bold+Cyan, Reset)
+	fmt.Printf("File %s%s%s không tồn tại.\n\n", Yellow, app.FilePath, Reset)
+	fmt.Println("Chọn:")
+	fmt.Printf("  %s1%s. Tạo file mới với template mặc định\n", Bold+Cyan, Reset)
+	fmt.Printf("  %s2%s. Nhập đường dẫn file khác\n", Bold+Cyan, Reset)
+	fmt.Printf("  %s3%s. Thoát\n", Bold+Cyan, Reset)
+	fmt.Printf("\nLựa chọn (1/2/3): ")
+
+	inputReader := bufio.NewReader(os.Stdin)
+	input, _ := inputReader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	switch input {
+	case "1":
+		createDefaultFile()
+	case "2":
+		fmt.Printf("Nhập đường dẫn file: ")
+		path, _ := inputReader.ReadString('\n')
+		path = strings.TrimSpace(path)
+		if path == "" {
+			fmt.Println("Đường dẫn trống. Thoát.")
+			os.Exit(1)
+		}
+		app.FilePath = path
+		if !fileExists(app.FilePath) {
+			fmt.Printf("File %s không tồn tại. Thoát.\n", app.FilePath)
+			os.Exit(1)
+		}
+	default:
+		fmt.Println("Thoát.")
+		os.Exit(0)
+	}
+}
+
+// createDefaultFile creates a new markdown file with default template.
+func createDefaultFile() {
+	if err := os.WriteFile(app.FilePath, []byte(defaultTemplate), 0o644); err != nil {
+		fmt.Printf("❌ Không thể tạo file: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("%s✅ Đã tạo file %s%s\n", Green, app.FilePath, Reset)
+	time.Sleep(time.Second)
 }
 
 // handleInput reads and processes a single keyboard input.
@@ -699,10 +822,12 @@ func handleInput() {
 	// System
 	case b[0] == 's' || b[0] == 'S': // save
 		app.SaveFile()
+		app.SaveState(renderer.PageSize)
 	case b[0] == 'q' || b[0] == 'Q' || b[0] == 3: // quit or Ctrl+C
 		terminal.SetRawMode(false)
+		app.SaveState(renderer.PageSize)
 		ClearScreen()
-		fmt.Println("👋 Tạm biệt! File đã lưu.")
+		fmt.Println("👋 Tạm biệt! Tiến độ đã lưu.")
 		os.Exit(0)
 	case b[0] == '?': // help
 		handleHelp()
@@ -835,48 +960,568 @@ func handleToggle() {
 	terminal.SetRawMode(true)
 }
 
-// handleNote prompts for note text and adds it to current section.
+// handleNote provides a menu for note management.
 func handleNote() {
 	terminal.SetRawMode(false)
-	ClearScreen()
+	// Reset terminal to sane state for proper input
+	exec.Command("stty", "sane").Run()
 
 	sec := app.GetCurrentSection()
-	fmt.Printf("%s📝 THÊM GHI CHÚ%s\n", Bold, Reset)
-	fmt.Printf("Section: %s\n", sec.Title)
-	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
-	fmt.Println("Nhập ghi chú (Enter 2 lần để kết thúc):")
-	fmt.Println()
-
-	inputReader := bufio.NewReader(os.Stdin)
-	var noteLines []string
-	emptyCount := 0
+	existingNotes := extractNotes(sec.Content)
 
 	for {
-		line, _ := inputReader.ReadString('\n')
-		line = strings.TrimRight(line, "\n\r")
+		ClearScreen()
+		fmt.Printf("%s📝 GHI CHÚ - %s%s\n", Bold+Cyan, sec.Title, Reset)
+		fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
 
-		if line == "" {
-			emptyCount++
-			if emptyCount >= 2 {
-				break
+		if len(existingNotes) > 0 {
+			fmt.Printf("\n%sGhi chú hiện có (%d):%s\n\n", Yellow, len(existingNotes), Reset)
+			for i, note := range existingNotes {
+				// Truncate long notes for display
+				displayNote := note
+				if len(displayNote) > 200 {
+					displayNote = displayNote[:200] + "..."
+				}
+				// Clean up for display
+				displayNote = strings.ReplaceAll(displayNote, "\n", " ")
+				fmt.Printf("  %s%d.%s %s\n", Cyan, i+1, Reset, displayNote)
 			}
 		} else {
-			emptyCount = 0
+			fmt.Printf("\n%sChưa có ghi chú nào.%s\n", Dim, Reset)
 		}
-		noteLines = append(noteLines, line)
+
+		fmt.Println()
+		fmt.Printf("%sChọn:%s\n", Bold, Reset)
+		fmt.Printf("  %sa%s - Thêm ghi chú mới\n", Cyan, Reset)
+		if len(existingNotes) > 0 {
+			fmt.Printf("  %sv%s - Xem chi tiết ghi chú\n", Cyan, Reset)
+			fmt.Printf("  %se%s - Sửa ghi chú\n", Cyan, Reset)
+			fmt.Printf("  %sd%s - Xóa ghi chú\n", Cyan, Reset)
+			fmt.Printf("  %sc%s - Xóa TẤT CẢ ghi chú (clean)\n", Cyan, Reset)
+		}
+		fmt.Printf("  %sq%s - Quay lại\n", Cyan, Reset)
+		fmt.Printf("\nLựa chọn: ")
+
+		reader := bufio.NewReader(os.Stdin)
+		choice, _ := reader.ReadString('\n')
+		choice = strings.TrimSpace(strings.ToLower(choice))
+
+		switch choice {
+		case "a":
+			addNewNote(reader)
+			// Refresh notes list
+			sec = app.GetCurrentSection()
+			existingNotes = extractNotes(sec.Content)
+		case "v":
+			if len(existingNotes) > 0 {
+				viewNoteDetail(existingNotes, reader)
+			}
+		case "e":
+			if len(existingNotes) > 0 {
+				if editNote(reader, existingNotes) {
+					// Refresh after edit
+					sec = app.GetCurrentSection()
+					existingNotes = extractNotes(sec.Content)
+				}
+			}
+		case "d":
+			if len(existingNotes) > 0 {
+				if deleteNote(reader, existingNotes) {
+					// Refresh after delete
+					sec = app.GetCurrentSection()
+					existingNotes = extractNotes(sec.Content)
+				}
+			}
+		case "c":
+			if len(existingNotes) > 0 {
+				if cleanAllNotes(reader) {
+					// Refresh after clean
+					sec = app.GetCurrentSection()
+					existingNotes = extractNotes(sec.Content)
+				}
+			}
+		case "q", "":
+			terminal.SetRawMode(true)
+			return
+		}
+	}
+}
+
+// addNewNote handles adding a new note using an external editor.
+// This ensures proper UTF-8 support and cursor navigation.
+func addNewNote(reader *bufio.Reader) {
+	ClearScreen()
+	fmt.Printf("%s📝 THÊM GHI CHÚ MỚI%s\n", Bold+Cyan, Reset)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+	fmt.Println()
+
+	// Create temp file for editing
+	tmpFile, err := os.CreateTemp("", "sre-note-*.txt")
+	if err != nil {
+		fmt.Printf("%s❌ Lỗi tạo file tạm: %v%s\n", Red, err, Reset)
+		fmt.Printf("\n%s[Enter để quay lại]%s", Dim, Reset)
+		reader.ReadString('\n')
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	tmpFile.Close()
+
+	// Find editor
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		// Try common editors
+		for _, e := range []string{"nano", "vim", "vi", "notepad"} {
+			if _, err := exec.LookPath(e); err == nil {
+				editor = e
+				break
+			}
+		}
 	}
 
-	note := strings.TrimSpace(strings.Join(noteLines, "\n"))
-	if note != "" {
-		app.AddNote(note)
-		app.UpdateFileSection(app.CurrentIdx)
-		app.ParseSections()
-		app.SaveFile()
-		fmt.Println(Green + "✅ Đã lưu ghi chú!" + Reset)
+	if editor == "" {
+		// Fallback to simple stdin input
+		fmt.Println("Không tìm thấy editor (nano/vim). Dùng input đơn giản:")
+		fmt.Println("(Nhập ghi chú, dòng trống để kết thúc)")
+		fmt.Println()
+
+		var lines []string
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				break
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				break
+			}
+			lines = append(lines, line)
+		}
+
+		note := strings.TrimSpace(strings.Join(lines, "\n"))
+		if note != "" {
+			saveNote(note)
+		}
+		return
+	}
+
+	fmt.Printf("Mở %s%s%s để soạn ghi chú...\n", Bold+Cyan, editor, Reset)
+	fmt.Printf("%s(Lưu và thoát editor để hoàn thành)%s\n", Dim, Reset)
+	time.Sleep(500 * time.Millisecond)
+
+	// Open editor
+	cmd := exec.Command(editor, tmpPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("\n%s❌ Lỗi mở editor: %v%s\n", Red, err, Reset)
+		fmt.Printf("\n%s[Enter để quay lại]%s", Dim, Reset)
+		reader.ReadString('\n')
+		return
+	}
+
+	// Read the edited content
+	content, err := os.ReadFile(tmpPath)
+	if err != nil {
+		fmt.Printf("\n%s❌ Lỗi đọc file: %v%s\n", Red, err, Reset)
+		fmt.Printf("\n%s[Enter để quay lại]%s", Dim, Reset)
+		reader.ReadString('\n')
+		return
+	}
+
+	note := strings.TrimSpace(string(content))
+	if note == "" {
+		fmt.Printf("\n%sGhi chú trống - đã hủy.%s\n", Yellow, Reset)
 		time.Sleep(time.Second)
+		return
 	}
 
-	terminal.SetRawMode(true)
+	saveNote(note)
+}
+
+// saveNote saves a note to the current section.
+func saveNote(note string) {
+	app.AddNote(note)
+	app.UpdateFileSection(app.CurrentIdx)
+	app.ParseSections()
+	if err := app.SaveFile(); err != nil {
+		fmt.Printf("\n%s❌ Lỗi lưu: %v%s\n", Red, err, Reset)
+	} else {
+		fmt.Printf("\n%s✅ Đã lưu ghi chú!%s\n", Green, Reset)
+	}
+	time.Sleep(time.Second)
+}
+
+// viewNoteDetail shows full content of a specific note.
+func viewNoteDetail(notes []string, reader *bufio.Reader) {
+	ClearScreen()
+	fmt.Printf("%s📖 XEM GHI CHÚ%s\n", Bold+Cyan, Reset)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+	fmt.Println()
+
+	for i := range notes {
+		fmt.Printf("  %s%d%s. Ghi chú #%d\n", Cyan, i+1, Reset, i+1)
+	}
+
+	fmt.Printf("\nNhập số (1-%d) hoặc Enter để quay lại: ", len(notes))
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	if input == "" {
+		return
+	}
+
+	idx, err := strconv.Atoi(input)
+	if err != nil || idx < 1 || idx > len(notes) {
+		return
+	}
+
+	// Show full note
+	ClearScreen()
+	fmt.Printf("%s📖 GHI CHÚ #%d%s\n", Bold+Cyan, idx, Reset)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+	fmt.Println()
+	fmt.Println(notes[idx-1])
+	fmt.Println()
+	fmt.Printf("%s[Enter để quay lại]%s", Dim, Reset)
+	reader.ReadString('\n')
+}
+
+// editNote opens an editor to modify an existing note.
+func editNote(reader *bufio.Reader, notes []string) bool {
+	ClearScreen()
+	fmt.Printf("%s✏️ SỬA GHI CHÚ%s\n", Bold+Cyan, Reset)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+	fmt.Println()
+
+	for i, note := range notes {
+		displayNote := note
+		if len(displayNote) > 100 {
+			displayNote = displayNote[:100] + "..."
+		}
+		displayNote = strings.ReplaceAll(displayNote, "\n", " ")
+		fmt.Printf("  %s%d%s. %s\n", Cyan, i+1, Reset, displayNote)
+	}
+
+	fmt.Printf("\nNhập số để sửa (1-%d) hoặc Enter để hủy: ", len(notes))
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	if input == "" {
+		return false
+	}
+
+	idx, err := strconv.Atoi(input)
+	if err != nil || idx < 1 || idx > len(notes) {
+		return false
+	}
+
+	oldNote := notes[idx-1]
+
+	// Extract just the note content (remove timestamp prefix)
+	noteContent := oldNote
+	if strings.HasPrefix(noteContent, "> **Ghi chú [") {
+		// Find the end of timestamp
+		if endIdx := strings.Index(noteContent, ":**"); endIdx != -1 {
+			noteContent = strings.TrimSpace(noteContent[endIdx+3:])
+		}
+	}
+	// Remove leading > from subsequent lines
+	lines := strings.Split(noteContent, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimPrefix(strings.TrimPrefix(line, "> "), ">")
+	}
+	noteContent = strings.Join(lines, "\n")
+
+	// Create temp file with existing content
+	tmpFile, err := os.CreateTemp("", "sre-note-edit-*.txt")
+	if err != nil {
+		fmt.Printf("%s❌ Lỗi tạo file tạm: %v%s\n", Red, err, Reset)
+		fmt.Printf("\n%s[Enter để quay lại]%s", Dim, Reset)
+		reader.ReadString('\n')
+		return false
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	tmpFile.WriteString(noteContent)
+	tmpFile.Close()
+
+	// Find editor
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		for _, e := range []string{"nano", "vim", "vi"} {
+			if _, err := exec.LookPath(e); err == nil {
+				editor = e
+				break
+			}
+		}
+	}
+
+	if editor == "" {
+		fmt.Printf("%s❌ Không tìm thấy editor%s\n", Red, Reset)
+		fmt.Printf("\n%s[Enter để quay lại]%s", Dim, Reset)
+		reader.ReadString('\n')
+		return false
+	}
+
+	fmt.Printf("\nMở %s%s%s để sửa...\n", Bold+Cyan, editor, Reset)
+	time.Sleep(500 * time.Millisecond)
+
+	// Open editor
+	cmd := exec.Command(editor, tmpPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("\n%s❌ Lỗi mở editor: %v%s\n", Red, err, Reset)
+		fmt.Printf("\n%s[Enter để quay lại]%s", Dim, Reset)
+		reader.ReadString('\n')
+		return false
+	}
+
+	// Read edited content
+	content, err := os.ReadFile(tmpPath)
+	if err != nil {
+		fmt.Printf("\n%s❌ Lỗi đọc file: %v%s\n", Red, err, Reset)
+		fmt.Printf("\n%s[Enter để quay lại]%s", Dim, Reset)
+		reader.ReadString('\n')
+		return false
+	}
+
+	newNote := strings.TrimSpace(string(content))
+	if newNote == "" {
+		fmt.Printf("\n%sGhi chú trống - đã hủy.%s\n", Yellow, Reset)
+		time.Sleep(time.Second)
+		return false
+	}
+
+	// Replace old note with new one
+	sec := app.GetCurrentSection()
+	newContent := removeNoteFromContent(sec.Content, oldNote)
+	app.Sections[app.CurrentIdx].Content = newContent
+
+	// Add the edited note
+	app.AddNote(newNote)
+	app.UpdateFileSection(app.CurrentIdx)
+	app.ParseSections()
+
+	if err := app.SaveFile(); err != nil {
+		fmt.Printf("\n%s❌ Lỗi lưu: %v%s\n", Red, err, Reset)
+		time.Sleep(time.Second)
+		return false
+	}
+
+	fmt.Printf("\n%s✅ Đã cập nhật ghi chú!%s\n", Green, Reset)
+	time.Sleep(time.Second)
+	return true
+}
+
+// deleteNote removes a note from the section.
+func deleteNote(reader *bufio.Reader, notes []string) bool {
+	ClearScreen()
+	fmt.Printf("%s🗑️ XÓA GHI CHÚ%s\n", Bold+Red, Reset)
+	fmt.Println(Dim + strings.Repeat("─", 60) + Reset)
+	fmt.Println()
+
+	for i, note := range notes {
+		displayNote := note
+		if len(displayNote) > 100 {
+			displayNote = displayNote[:100] + "..."
+		}
+		displayNote = strings.ReplaceAll(displayNote, "\n", " ")
+		fmt.Printf("  %s%d%s. %s\n", Cyan, i+1, Reset, displayNote)
+	}
+
+	fmt.Printf("\nNhập số để xóa (1-%d) hoặc Enter để hủy: ", len(notes))
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	if input == "" {
+		return false
+	}
+
+	idx, err := strconv.Atoi(input)
+	if err != nil || idx < 1 || idx > len(notes) {
+		return false
+	}
+
+	// Confirm delete
+	fmt.Printf("\n%sXác nhận xóa ghi chú #%d? (y/N): %s", Yellow, idx, Reset)
+	confirm, _ := reader.ReadString('\n')
+	confirm = strings.TrimSpace(strings.ToLower(confirm))
+
+	if confirm != "y" && confirm != "yes" {
+		return false
+	}
+
+	// Remove note from content
+	noteToDelete := notes[idx-1]
+	sec := app.GetCurrentSection()
+	newContent := removeNoteFromContent(sec.Content, noteToDelete)
+	app.Sections[app.CurrentIdx].Content = newContent
+
+	app.UpdateFileSection(app.CurrentIdx)
+	app.ParseSections()
+	if err := app.SaveFile(); err != nil {
+		fmt.Printf("\n%s❌ Lỗi: %v%s\n", Red, err, Reset)
+		time.Sleep(time.Second)
+		return false
+	}
+
+	fmt.Printf("\n%s✅ Đã xóa ghi chú!%s\n", Green, Reset)
+	time.Sleep(time.Second)
+	return true
+}
+
+// removeNoteFromContent removes a specific note from section content.
+func removeNoteFromContent(content, noteToRemove string) string {
+	// Find and remove the note block
+	lines := strings.Split(content, "\n")
+	var result []string
+	skipUntilNonNote := false
+	noteLines := strings.Split(noteToRemove, "\n")
+	firstNoteLine := ""
+	if len(noteLines) > 0 {
+		firstNoteLine = strings.TrimSpace(noteLines[0])
+	}
+
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+
+		// Check if this is the start of the note to delete
+		if strings.Contains(trimmed, "**Ghi chú [") && strings.Contains(firstNoteLine, trimmed[2:]) {
+			skipUntilNonNote = true
+			continue
+		}
+
+		if skipUntilNonNote {
+			// Skip lines that are part of the note (start with > or are empty after note)
+			if strings.HasPrefix(trimmed, ">") {
+				continue
+			}
+			// Also skip empty lines immediately after note
+			if trimmed == "" && i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), ">") {
+				continue
+			}
+			skipUntilNonNote = false
+		}
+
+		result = append(result, line)
+	}
+
+	// Clean up multiple consecutive empty lines
+	return strings.TrimSpace(strings.Join(result, "\n"))
+}
+
+// cleanAllNotes removes all notes from current section.
+func cleanAllNotes(reader *bufio.Reader) bool {
+	fmt.Printf("\n%s⚠️ Xác nhận xóa TẤT CẢ ghi chú trong section này? (y/N): %s", Yellow, Reset)
+	confirm, _ := reader.ReadString('\n')
+	confirm = strings.TrimSpace(strings.ToLower(confirm))
+
+	if confirm != "y" && confirm != "yes" {
+		return false
+	}
+
+	// Remove all notes from content
+	sec := app.GetCurrentSection()
+	lines := strings.Split(sec.Content, "\n")
+	var result []string
+	inNote := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Check if this is start of a note
+		if strings.HasPrefix(trimmed, "> **Ghi chú [") {
+			inNote = true
+			continue
+		}
+
+		if inNote {
+			if strings.HasPrefix(trimmed, ">") {
+				continue // Skip note content
+			}
+			if trimmed == "" {
+				continue // Skip empty lines after note
+			}
+			inNote = false
+		}
+
+		result = append(result, line)
+	}
+
+	app.Sections[app.CurrentIdx].Content = strings.TrimSpace(strings.Join(result, "\n"))
+	app.UpdateFileSection(app.CurrentIdx)
+	app.ParseSections()
+
+	if err := app.SaveFile(); err != nil {
+		fmt.Printf("\n%s❌ Lỗi: %v%s\n", Red, err, Reset)
+		time.Sleep(time.Second)
+		return false
+	}
+
+	fmt.Printf("\n%s✅ Đã xóa tất cả ghi chú!%s\n", Green, Reset)
+	time.Sleep(time.Second)
+	return true
+}
+
+// extractNotes extracts existing notes from section content.
+func extractNotes(content string) []string {
+	var notes []string
+	lines := strings.Split(content, "\n")
+	var currentNote strings.Builder
+	inNote := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "> **Ghi chú [") {
+			// Save previous note if exists
+			if currentNote.Len() > 0 {
+				notes = append(notes, strings.TrimSpace(currentNote.String()))
+			}
+			currentNote.Reset()
+			inNote = true
+			currentNote.WriteString(trimmed)
+		} else if inNote && strings.HasPrefix(trimmed, ">") {
+			currentNote.WriteString("\n")
+			currentNote.WriteString(trimmed)
+		} else if inNote && trimmed == "" {
+			// Empty line might be part of note or end of note
+			// Look ahead logic would be complex, so just end the note
+			if currentNote.Len() > 0 {
+				notes = append(notes, strings.TrimSpace(currentNote.String()))
+				currentNote.Reset()
+			}
+			inNote = false
+		} else {
+			// Non-note line
+			if inNote && currentNote.Len() > 0 {
+				notes = append(notes, strings.TrimSpace(currentNote.String()))
+				currentNote.Reset()
+			}
+			inNote = false
+		}
+	}
+
+	// Don't forget last note
+	if currentNote.Len() > 0 {
+		notes = append(notes, strings.TrimSpace(currentNote.String()))
+	}
+
+	return notes
 }
 
 // handleHelp displays all keyboard shortcuts.
@@ -904,8 +1549,8 @@ func handleHelp() {
 		{"/", "Tìm kiếm section"},
 		{"", ""},
 		{"x", "Toggle checkbox (tick/untick)"},
-		{"a", "Thêm ghi chú (add note)"},
-		{"s", "Lưu file"},
+		{"a", "Ghi chú (thêm/xem/sửa/xóa)"},
+		{"s", "Lưu file & tiến độ"},
 		{"", ""},
 		{"+", "Tăng 10 dòng hiển thị"},
 		{"-", "Giảm 10 dòng hiển thị"},
@@ -926,6 +1571,13 @@ func handleHelp() {
 	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "j/k", Reset, "Di chuyển lên/xuống")
 	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "Enter", Reset, "Chọn section")
 	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "q/Esc", Reset, "Đóng TOC")
+
+	fmt.Printf("\n%sGhi chú (nhấn a):%s\n", Bold+Magenta, Reset)
+	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "a", Reset, "Thêm mới (mở editor)")
+	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "v", Reset, "Xem chi tiết")
+	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "e", Reset, "Sửa ghi chú")
+	fmt.Printf("  %s%-10s%s %s\n", Bold+Cyan, "d", Reset, "Xóa")
+	fmt.Printf("  %sDùng nano/vim, set EDITOR env để đổi editor%s\n", Dim, Reset)
 
 	fmt.Printf("\n%sHiện tại: %d dòng/trang (nhấn +/- để chỉnh, không giới hạn)%s\n", Dim, renderer.PageSize, Reset)
 
